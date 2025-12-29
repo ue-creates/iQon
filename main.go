@@ -23,6 +23,7 @@ type Channel struct {
 type User struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	Bot  bool   `json:"bot"`
 }
 
 type ActivityMessage struct {
@@ -53,10 +54,12 @@ type ExtensionInit struct {
 var (
 	botToken string
 
+	// データキャッシュ (名簿)
 	channelMap = make(map[string]Channel)
 	userMap    = make(map[string]string)
 	mapMutex   sync.RWMutex
 
+	// 現在の状態 (Path -> Username)
 	lastSpeakers = make(map[string]string)
 	stateMutex   sync.RWMutex
 
@@ -77,7 +80,7 @@ func main() {
 	}
 
 	log.Println("⏳ Fetching initial data...")
-	if err := fetchData(); err != nil {
+	if err := fetchInitialData(); err != nil {
 		log.Fatalf("Failed to fetch initial data: %v", err)
 	}
 
@@ -97,7 +100,7 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("🚀 Server started on :%s (Polling Mode)", port)
+	log.Printf("🚀 Server started on :%s (Auto-Learning Mode)", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
 	}
@@ -113,6 +116,7 @@ func startPolling() {
 	log.Println("👀 Polling started...")
 
 	for range ticker.C {
+		// 全パブリックチャンネルのアクテビティを取得
 		url := "https://q.trap.jp/api/v3/activity/timeline?all=true&limit=50"
 		req, _ := http.NewRequest("GET", url, nil)
 		req.Header.Set("Authorization", "Bearer "+botToken)
@@ -149,20 +153,23 @@ func processTimeline(messages []ActivityMessage) {
 	newestInBatch := lastCheckTime
 	updates := make(map[string]ExtensionUpdate)
 
+	// APIは新しい順に来るので、逆順（古い順）に処理
 	for i := len(messages) - 1; i >= 0; i-- {
 		msg := messages[i]
 
+		// すでに処理済みの時刻以前ならスキップ
 		if !msg.CreatedAt.After(lastCheckTime) {
 			continue
 		}
+		// 最新時刻の更新
 		if msg.CreatedAt.After(newestInBatch) {
 			newestInBatch = msg.CreatedAt
 		}
 
+		// ★ ここで学習機能付きの解決関数を呼ぶ
 		username := resolveUser(msg.UserID)
 		path := resolveChannelPath(msg.ChannelID)
 
-		// ユーザー解決できなかった場合(webhookなど)も "webhook" という名前で返ってくるので続行可能
 		if username == "" || path == "" {
 			continue
 		}
@@ -180,34 +187,150 @@ func processTimeline(messages []ActivityMessage) {
 		stateMutex.Lock()
 		for path, update := range updates {
 			lastSpeakers[path] = update.Username
-			// log.Printf("📢 Polled: %s -> @%s", path, update.Username) // ログがうるさければコメントアウト
+			log.Printf("📢 Update: %s -> @%s", path, update.Username)
 			broadcastToClients(update)
 		}
 		stateMutex.Unlock()
 	}
 }
 
-// --- データ解決ロジック ---
+// --- 学習機能付き解決ロジック ---
 
+// resolveUser: キャッシュになければAPIから取得して登録する
 func resolveUser(userID string) string {
+	// 1. キャッシュチェック (Read Lock)
 	mapMutex.RLock()
 	name, ok := userMap[userID]
 	mapMutex.RUnlock()
-	
 	if ok {
-		// 名簿にある(普通のユーザー)
 		return name
 	}
+
+	// 2. キャッシュになければAPIへ問い合わせ
+	// (ロックを外してから通信する)
+	log.Printf("🔍 Unknown UserID: %s. Fetching...", userID)
 	
-	// 名簿にない -> Webhookとみなして固定文字列を返す
-	// クライアント側でこれを受け取ったら固定画像を表示する
-	return "webhook"
+	newUser, err := fetchSingleUser(userID)
+	
+	// 3. 結果を登録 (Write Lock)
+	mapMutex.Lock()
+	defer mapMutex.Unlock()
+
+	// 通信中に別のゴルーチンが書き込んだかもしれないので再チェック
+	if name, exists := userMap[userID]; exists {
+		return name
+	}
+
+	if err != nil {
+		log.Printf("⚠️ User fetch failed (%v). Treating as webhook.", err)
+		// 取得に失敗したら "webhook" として登録し、次回以降のエラーを防ぐ
+		userMap[userID] = "webhook"
+		return "webhook"
+	}
+
+	userMap[userID] = newUser.Name
+	log.Printf("✅ Learned User: %s -> @%s", userID, newUser.Name)
+	return newUser.Name
 }
 
-// ... fetchData, resolveChannelPath, handleConnections, broadcastToClients は以前と同じなので省略可 ...
-// (以前のコードの fetchData以降 をそのまま使ってください。fetchSingleUserは削除してOKです)
+// resolveChannelPath: 親も含めてパスを解決。知らなければ取得して登録する
+func resolveChannelPath(channelID string) string {
+	// パス構築用の一時キャッシュとして使うマップのコピーを持つのは非効率なので、
+	// 毎回親をたどる方式にする。足りない親がいればその都度fetchする。
 
-func fetchData() error {
+	path := ""
+	currentID := channelID
+
+	for {
+		// 1. キャッシュチェック
+		mapMutex.RLock()
+		ch, ok := channelMap[currentID]
+		mapMutex.RUnlock()
+
+		// 2. 知らないチャンネルならAPIから取得
+		if !ok {
+			log.Printf("🔍 Unknown ChannelID: %s. Fetching...", currentID)
+			fetchedCh, err := fetchSingleChannel(currentID)
+			
+			mapMutex.Lock()
+			if err != nil {
+				mapMutex.Unlock()
+				log.Printf("❌ Failed to fetch channel %s: %v", currentID, err)
+				return "" // 解決不能
+			}
+			// 登録
+			channelMap[currentID] = *fetchedCh
+			ch = *fetchedCh
+			mapMutex.Unlock()
+			log.Printf("✅ Learned Channel: %s", ch.Name)
+		}
+
+		// パスを積み上げ
+		path = "/" + ch.Name + path
+
+		// ルートまで来たら終了
+		if ch.ParentID == "" || ch.ParentID == "00000000-0000-0000-0000-000000000000" {
+			break
+		}
+		currentID = ch.ParentID
+	}
+
+	return "/channels" + path
+}
+
+// --- 単発取得用APIクライアント ---
+
+func fetchSingleUser(userID string) (*User, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	url := fmt.Sprintf("https://q.trap.jp/api/v3/users/%s", userID)
+	
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+botToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	var u User
+	if err := json.NewDecoder(resp.Body).Decode(&u); err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+func fetchSingleChannel(channelID string) (*Channel, error) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	url := fmt.Sprintf("https://q.trap.jp/api/v3/channels/%s", channelID)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+botToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	var ch Channel
+	if err := json.NewDecoder(resp.Body).Decode(&ch); err != nil {
+		return nil, err
+	}
+	return &ch, nil
+}
+
+// --- 初期データ一括取得 (起動時用) ---
+
+func fetchInitialData() error {
 	client := &http.Client{}
 
 	// チャンネル
@@ -224,7 +347,7 @@ func fetchData() error {
 		return fmt.Errorf("decode channels error: %w", err)
 	}
 
-	// ユーザー
+	// ユーザー (include-suspended=trueで凍結ユーザーも取得)
 	reqUser, _ := http.NewRequest("GET", "https://q.trap.jp/api/v3/users?include-suspended=true", nil)
 	reqUser.Header.Set("Authorization", "Bearer "+botToken)
 	respUser, err := client.Do(reqUser)
@@ -250,27 +373,6 @@ func fetchData() error {
 	
 	log.Printf("✅ Data Loaded: %d channels, %d users", len(channelMap), len(userMap))
 	return nil
-}
-
-func resolveChannelPath(channelID string) string {
-	mapMutex.RLock()
-	defer mapMutex.RUnlock()
-
-	path := ""
-	currentID := channelID
-
-	for {
-		ch, ok := channelMap[currentID]
-		if !ok {
-			return "" 
-		}
-		path = "/" + ch.Name + path
-		if ch.ParentID == "" || ch.ParentID == "00000000-0000-0000-0000-000000000000" {
-			break
-		}
-		currentID = ch.ParentID
-	}
-	return "/channels" + path
 }
 
 func handleConnections(w http.ResponseWriter, r *http.Request) {
